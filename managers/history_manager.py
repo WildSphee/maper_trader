@@ -68,10 +68,10 @@ class HistoryManager:
         self.interval_ms = INTERVAL_TO_MS[interval]
 
         self.predictor_cols = [
-            "EMA","CMO","MINUSDM","PLUSDM","CLOSE","CLOSEL1","CLOSEL2","CLOSEL3",
+            "EMA","MINUSDM","PLUSDM","CLOSE","CLOSEL1","CLOSEL2",
             "PATT_3OUT","PATT_CMB","RSI","MACD","MACD_SIGNAL","MACD_HIST","ADX",
             "ATR","NATR","BB_UPPER","BB_MIDDLE","BB_LOWER","BB_WIDTH","OBV","MFI",
-            "AD","ADOSC","STOCH_K","STOCH_D","TRIX","ROC",
+            "AD","ADOSC","STOCH_K","STOCH_D",
         ] # type: ignore
 
         raw = self.client.get_historical_klines(
@@ -84,7 +84,7 @@ class HistoryManager:
     def _recompute_features(self) -> None:
         df = self.df_ohlcv
         if len(df) < max(self.timelag, 30):
-            self.df_features = pd.DataFrame()  # not enough data yet
+            self.df_features = pd.DataFrame()
             return
 
         close = df["close"].to_numpy(dtype=float)
@@ -94,7 +94,7 @@ class HistoryManager:
         vol = df["volume"].to_numpy(dtype=float)
 
         ema = talib.EMA(close, timeperiod=self.timelag)
-        cmo = talib.CMO(close, timeperiod=self.timelag)
+        # cmo = talib.CMO(close, timeperiod=self.timelag)
         minusdm = talib.MINUS_DM(high, low, timeperiod=self.timelag)
         plusdm = talib.PLUS_DM(high, low, timeperiod=self.timelag)
 
@@ -103,13 +103,13 @@ class HistoryManager:
 
         closel1 = df["close"].shift(1)
         closel2 = df["close"].shift(2)
-        closel3 = df["close"].shift(3)
+        # closel3 = df["close"].shift(3)
 
         rsi = talib.RSI(close, timeperiod=self.timelag)
         macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
         adx = talib.ADX(high, low, close, timeperiod=self.timelag)
-        trix = talib.TRIX(close, timeperiod=self.timelag)
-        roc = talib.ROC(close, timeperiod=self.timelag)
+        # trix = talib.TRIX(close, timeperiod=self.timelag)
+        # roc = talib.ROC(close, timeperiod=self.timelag)
 
         atr = talib.ATR(high, low, close, timeperiod=self.timelag)
         natr = talib.NATR(high, low, close, timeperiod=self.timelag)
@@ -139,14 +139,14 @@ class HistoryManager:
 
         feat = pd.DataFrame(
             {
-                "EMA": ema, "CMO": cmo, "MINUSDM": minusdm, "PLUSDM": plusdm,
-                "CLOSE": df["close"], "CLOSEL1": closel1, "CLOSEL2": closel2, "CLOSEL3": closel3,
+                "EMA": ema, "MINUSDM": minusdm, "PLUSDM": plusdm,
+                "CLOSE": df["close"], "CLOSEL1": closel1, "CLOSEL2": closel2,
                 "PATT_3OUT": patt_3out, "PATT_CMB": patt_cmb,
                 "RSI": rsi, "MACD": macd, "MACD_SIGNAL": macd_sig, "MACD_HIST": macd_hist,
                 "ADX": adx, "ATR": atr, "NATR": natr,
                 "BB_UPPER": bb_upper, "BB_MIDDLE": bb_middle, "BB_LOWER": bb_lower, "BB_WIDTH": bb_width,
                 "OBV": obv, "MFI": mfi, "AD": ad, "ADOSC": adosc,
-                "STOCH_K": stoch_k, "STOCH_D": stoch_d, "TRIX": trix, "ROC": roc,
+                "STOCH_K": stoch_k, "STOCH_D": stoch_d,
             }, # type: ignore
             index=df.index,
         )
@@ -170,14 +170,7 @@ class HistoryManager:
             last_known_open = self.df_ohlcv.index[-1]
             to_append = df_recent[df_recent.index > last_known_open]
             if not to_append.empty:
-                self.df_ohlcv = (
-                    pd.concat([self.df_ohlcv, to_append])
-                    .sort_index()
-                    .loc[~pd.Index.duplicated(pd.Index.union(self.df_ohlcv.index, to_append.index), keep="last")]
-                )
-                # The above .loc line keeps last occurrence if any dupes sneak in.
-                # Simpler/clearer (and fast) alternative:
-                self.df_ohlcv = self.df_ohlcv[~self.df_ohlcv.index.duplicated(keep="last")]
+                self.df_ohlcv = self.df_ohlcv[~self.df_ohlcv.index.duplicated(keep="last")] # keep only the last occurance
 
         self._recompute_features()
 
@@ -199,3 +192,15 @@ class HistoryManager:
         X = self.df_features[self.predictor_cols].copy()
         y = self.df_features["UP_DOWN"].copy()
         return X, y
+
+    def export_features_csv(self, path: str) -> None:
+        """Export engineered features to CSV."""
+        if self.df_features.empty:
+            raise RuntimeError("No features to export yet.")
+        self.df_features.to_csv(path, index=True)
+
+    def export_ohlcv_csv(self, path: str) -> None:
+        """Export raw open, high, low, close, volume to CSV."""
+        if self.df_ohlcv.empty:
+            raise RuntimeError("No OHLCV data to export yet.")
+        self.df_ohlcv.to_csv(path, index=True)
