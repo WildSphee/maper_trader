@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+
 @dataclass
 class SizingConfig:
     kelly_cap: float = 0.20

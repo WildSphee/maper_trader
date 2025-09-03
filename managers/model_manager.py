@@ -1,8 +1,7 @@
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import numpy as np
 import pandas as pd
-
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
@@ -13,7 +12,6 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
-
 
 
 class ModelManager:
@@ -28,9 +26,9 @@ class ModelManager:
         model_name: str = "logreg",
     ) -> None:
         self.predictor_cols = predictor_cols
-        self.numeric_cols = predictor_cols[:-2]  
+        self.numeric_cols = predictor_cols[:-2]
         self.model_name = model_name
-      
+
     def _build_model(self, name: str):
         if name == "logreg":
             return LogisticRegression(
@@ -95,9 +93,8 @@ class ModelManager:
         return self.last_test_accuracy
 
     def predict(self, X_one: Union[pd.DataFrame, np.ndarray]) -> float:
-        
         if self.pipeline is None:
             raise RuntimeError("Model is not trained.")
-        
+
         proba = self.pipeline.predict_proba(X_one)[0][1]
         return float(proba)
