@@ -153,6 +153,8 @@ class HistoryManager:
 
         up_down = (df["close"].shift(-1) > df["close"]).astype("float64")
         feat["UP_DOWN"] = up_down
+        ret_next = np.log(df["close"].shift(-1)) - np.log(df["close"])
+        feat["RET_NEXT"] = ret_next
         feat.replace([np.inf, -np.inf], np.nan, inplace=True)
         feat.dropna(inplace=True)
         feat = feat.astype({"UP_DOWN": "int64"})
@@ -192,6 +194,15 @@ class HistoryManager:
         X = self.df_features[self.predictor_cols].copy()
         y = self.df_features["UP_DOWN"].copy()
         return X, y
+
+    @property
+    def dataset_dual(self):
+        if self.df_features.empty:
+            raise RuntimeError("No features yet.")
+        X = self.df_features[self.predictor_cols].copy()
+        y_cls = self.df_features["UP_DOWN"].astype(int).copy()
+        y_reg = self.df_features["RET_NEXT"].copy()
+        return X, y_cls, y_reg
 
     def export_features_csv(self, path: str) -> None:
         """Export engineered features to CSV."""
