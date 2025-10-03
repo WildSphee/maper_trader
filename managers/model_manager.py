@@ -1,8 +1,14 @@
 from typing import List, Tuple, Union, Optional, Dict
 import numpy as np
 import pandas as pd
+
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+)
 from sklearn.linear_model import LogisticRegression, SGDClassifier, LinearRegression
 from sklearn.metrics import accuracy_score, mean_absolute_error
 from sklearn.model_selection import train_test_split
@@ -10,11 +16,16 @@ from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.inspection import permutation_importance
+
 
 class ModelManager:
     """
-    Dual-head manager: classifier for direction, regressor for next-bar return,
-    plus quantile regressors for uncertainty.
+    Dual-head manager:
+      - classifier for direction (UP_DOWN)
+      - regressor for next-bar log return (RET_NEXT)
+      - optional quantile regressors for uncertainty
+    Also exposes feature importances (native or permutation).
     """
 
     def __init__(
@@ -40,14 +51,20 @@ class ModelManager:
         self.qhi_pipe: Optional[Pipeline] = None
 
         self.last_cls_acc: Optional[float] = None
-        self.last_reg_mape: Optional[float] = None  # on returns, “MAPE” = mean abs pct err of exp(ret)-1
+        self.last_reg_mape: Optional[float] = None
         self.last_reg_mae: Optional[float] = None
+
+        # stored holdout (for diagnostics / importances)
+        self._X_te: Optional[pd.DataFrame] = None
+        self._yc_te: Optional[pd.Series] = None
+        self._yr_te: Optional[pd.Series] = None
 
     # ---------- blocks ----------
     def _needs_scaler(self, name: str) -> bool:
         return name in {"logreg", "sgdlog", "linsvc", "linreg"}
 
     def _selector(self):
+        # Selects columns in self.predictor_cols from a DataFrame
         return FunctionTransformer(
             lambda X: X[self.predictor_cols].to_numpy() if isinstance(X, pd.DataFrame) else X,
             feature_names_out="one-to-one",
@@ -79,13 +96,11 @@ class ModelManager:
         if name == "rf":
             return RandomForestRegressor(n_estimators=300, n_jobs=-1, random_state=self.random_state)
         if name == "hgb":
-            # squared_error is fine for returns
             from sklearn.ensemble import HistGradientBoostingRegressor
             return HistGradientBoostingRegressor(random_state=self.random_state)
         raise ValueError(f"Unknown regressor: {name}")
 
     def _build_quantile(self, q: float):
-        # Fast, robust quantile via GradientBoostingRegressor(loss="quantile")
         return GradientBoostingRegressor(loss="quantile", alpha=q, random_state=self.random_state)
 
     def _pipe(self, estimator, needs_scaler: bool) -> Pipeline:
@@ -106,12 +121,14 @@ class ModelManager:
         y_reg: Union[pd.Series, np.ndarray],
         test_size: float = 0.2,
     ) -> Dict[str, float]:
-        X_tr, X_te, yc_tr, yc_te = train_test_split(
-            X, y_cls, test_size=test_size, random_state=self.random_state, stratify=y_cls
-        )
-        # same split for regression to keep alignment
-        _, _, yr_tr, yr_te = train_test_split(
-            X, y_reg, test_size=test_size, random_state=self.random_state, stratify=None
+        """
+        Single, aligned split for X, y_cls, y_reg. Stores holdout for diagnostics.
+        """
+        X_tr, X_te, yc_tr, yc_te, yr_tr, yr_te = train_test_split(
+            X, y_cls, y_reg,
+            test_size=test_size,
+            random_state=self.random_state,
+            stratify=y_cls,
         )
 
         # classifier
@@ -119,12 +136,11 @@ class ModelManager:
         self.cls_pipe.fit(X_tr, yc_tr)
         cls_acc = accuracy_score(yc_te, self.cls_pipe.predict(X_te))
 
-        # regressor (expected return)
+        # regressor (expected log return)
         self.reg_pipe = self._pipe(self._build_regressor(self.reg_name), self._needs_scaler(self.reg_name))
         self.reg_pipe.fit(X_tr, yr_tr)
         pred_ret = self.reg_pipe.predict(X_te)
         mae = mean_absolute_error(yr_te, pred_ret)
-        # Convert to “MAPE” on price change: compare exp(ret)-1 vs exp(true)-1
         mape_like = np.mean(
             np.abs((np.expm1(pred_ret) - np.expm1(yr_te)) / (np.expm1(yr_te) + 1e-12))
         )
@@ -135,10 +151,70 @@ class ModelManager:
         self.qlo_pipe.fit(X_tr, yr_tr)
         self.qhi_pipe.fit(X_tr, yr_tr)
 
+        # store diagnostics
+        self._X_te, self._yc_te, self._yr_te = X_te, pd.Series(yc_te), pd.Series(yr_te)
         self.last_cls_acc = float(cls_acc)
         self.last_reg_mae = float(mae)
         self.last_reg_mape = float(mape_like)
         return {"cls_acc": self.last_cls_acc, "reg_mae": self.last_reg_mae, "reg_mape_like": self.last_reg_mape}
+
+    # ---- compat helper (classifier-only) so mm.train(X,y) works ----
+    def train(self, X: Union[pd.DataFrame, np.ndarray], y_cls: Union[pd.Series, np.ndarray],
+              test_size: float = 0.2) -> float:
+        X_tr, X_te, yc_tr, yc_te = train_test_split(
+            X, y_cls, test_size=test_size, random_state=self.random_state, stratify=y_cls
+        )
+        self.cls_pipe = self._pipe(self._build_classifier(self.cls_name), self._needs_scaler(self.cls_name))
+        self.cls_pipe.fit(X_tr, yc_tr)
+        acc = accuracy_score(yc_te, self.cls_pipe.predict(X_te))
+        self.last_cls_acc = float(acc)
+        self._X_te, self._yc_te = X_te, pd.Series(yc_te)
+        return self.last_cls_acc
+
+    # ---------- feature importances ----------
+    def feature_importances(
+        self,
+        which: str = "cls",             # "cls" or "reg"
+        kind: str = "auto",             # "auto" -> native if available, else "permutation"
+        scoring: Optional[str] = None,  # e.g. "accuracy" for cls, "r2" for reg, or "neg_mean_absolute_error"
+        n_repeats: int = 10,
+        random_state: Optional[int] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Returns a DataFrame with feature importances using either:
+          - native tree importances (if available and kind="auto")
+          - permutation_importance on stored holdout
+        """
+        pipe = self.cls_pipe if which == "cls" else self.reg_pipe
+        if pipe is None:
+            return None
+
+        # Try native importances
+        model = pipe.named_steps["model"]
+        if kind == "auto" and hasattr(model, "feature_importances_"):
+            imp = np.asarray(model.feature_importances_, dtype=float)
+            return pd.DataFrame({
+                "feature": self.predictor_cols,
+                "importance": imp,
+            }).sort_values("importance", ascending=False).reset_index(drop=True)
+
+        # Fallback: permutation importance on holdout
+        X_te = self._X_te
+        if X_te is None:
+            return None
+        scorer = scoring
+        if kind == "auto":
+            scorer = scorer or ("accuracy" if which == "cls" else "r2")
+
+        perm = permutation_importance(
+            pipe, X_te, (self._yc_te if which == "cls" else self._yr_te),
+            n_repeats=n_repeats, random_state=random_state or self.random_state, scoring=scorer
+        )
+        return pd.DataFrame({
+            "feature": self.predictor_cols,
+            "importance_mean": perm.importances_mean,
+            "importance_std": perm.importances_std,
+        }).sort_values("importance_mean", ascending=False).reset_index(drop=True)
 
     # ---------- inference (trading outputs) ----------
     def _ensure_trained(self):
@@ -149,15 +225,14 @@ class ModelManager:
         self,
         X_row: Union[pd.DataFrame, np.ndarray],
         current_price: float,
-        fee_bps: float = 2.0,        # per side, bps
-        slippage_bps: float = 1.0,   # per side, bps
-        kelly_cap: float = 0.2,      # cap max fraction
+        fee_bps: float = 2.0,
+        slippage_bps: float = 1.0,
+        kelly_cap: float = 0.2,
     ) -> Dict[str, float]:
         """
         Returns a compact dict of trading-ready metrics for one latest row.
         """
         self._ensure_trained()
-        # select single row
         x = X_row.iloc[-1:] if isinstance(X_row, pd.DataFrame) else X_row[-1:].reshape(1, -1)
 
         p_up = float(self.cls_pipe.predict_proba(x)[0][1])
@@ -165,38 +240,23 @@ class ModelManager:
         ret_qlo = float(self.qlo_pipe.predict(x)[0])          # low quantile log ret
         ret_qhi = float(self.qhi_pipe.predict(x)[0])          # high quantile log ret
 
-        # convert to simple returns
         r_mean = float(np.expm1(ret_mean))
         r_lo   = float(np.expm1(ret_qlo))
         r_hi   = float(np.expm1(ret_qhi))
 
-        # price forecasts
         px_exp = current_price * (1.0 + r_mean)
         px_lo  = current_price * (1.0 + r_lo)
         px_hi  = current_price * (1.0 + r_hi)
 
-        # costs
         roundtrip_cost = (fee_bps + slippage_bps) * 2.0 / 10_000.0
+        var_pct = min(0.0, r_lo)
 
-        # downside (VaR-ish at (1-q_high) level, using lower quantile)
-        var_pct = min(0.0, r_lo)  # a negative number (loss percent)
-
-        # suggested SL/TP from quantiles
-        stop_loss = px_lo
-        take_profit = px_hi
-
-        # Kelly fraction (approx): p = p_up, payoff ~ r_hi/abs(r_lo)
-        # Safeguards against divide-by-zero / signs
         gain = max(1e-6, r_hi)
         loss = max(1e-6, -min(0.0, r_lo))
         edge = p_up * gain - (1 - p_up) * loss
-        if gain > 0:
-            kelly = edge / gain
-        else:
-            kelly = 0.0
+        kelly = edge / gain if gain > 0 else 0.0
         kelly = float(np.clip(kelly, 0.0, kelly_cap))
 
-        # expected net return after costs (one-way)
         exp_net = r_mean - roundtrip_cost / 2.0
 
         return {
@@ -208,8 +268,8 @@ class ModelManager:
             "price_q10": px_lo,
             "price_q90": px_hi,
             "var_like": var_pct,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
+            "stop_loss": px_lo,
+            "take_profit": px_hi,
             "kelly_fraction": kelly,
             "expected_return_net_cost": exp_net,
             "roundtrip_cost": roundtrip_cost,

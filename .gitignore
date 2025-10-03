@@ -1,9 +1,11 @@
-venv
-.env
-
+# cache
 __pycache__
 .ruff_cache
 .mypy_cache
 
-# temp
-temp/*/*.csv
+# environment
+venv
+
+# creds
+.env
+
